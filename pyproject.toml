@@ -1,0 +1,14 @@
+[project]
+name = "imagecanvas-mini"
+description = "Small image editing tools for ComfyUI. Image Collage: drop images onto a grid on the node, arrange them, and output the composited image."
+version = "0.1.0"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/id-fa/ComfyUI-ImageCanvas-mini"
+
+[tool.comfy]
+PublisherId = "id-fa"
+DisplayName = "ImageCanvas mini"
+Repository = "https://github.com/id-fa/ComfyUI-ImageCanvas-mini"
+Icon = ""
