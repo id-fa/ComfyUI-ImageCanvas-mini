@@ -10,6 +10,8 @@ ComfyUI 上で動く、シンプルな画像編集ツールです。
 - 細かい画像処理は AI に投げればいいので、ノード上でのレタッチ機能は実装していません(レイヤー編集機能は将来実装するかもしれません)。
 - 単純な画像のリサイズやパディングの用途にも使えます。
 
+![screenshot](docs/screenshot.webp)
+
 ノードは **Image Collage (Canvas mini)** の 1 つです(カテゴリ `ImageCanvas-mini`)。
 
 ## インストール
