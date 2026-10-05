@@ -60,7 +60,7 @@ const STYLE = `
 .icm-status { flex: 0 0 auto; padding: 2px 4px; font-size: 10px; color: #9ca3af; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; background: #1a1a24; border: 1px solid #2a2a3a; border-top: none; border-radius: 0 0 4px 4px; }
 .icm-status.error { color: #fca5a5; }
 `;
-const HINT = "Drop images or use Load image · Drag to move · Corners to resize · Del to remove";
+const HINT = "Drop images · Drag: move · Corners: resize · Del: remove · Ctrl+drag: frame (1×1)";
 
 function ensureStyle() {
   if (document.getElementById(STYLE_ID)) return;
@@ -167,13 +167,21 @@ function createEditor(node, stateWidget) {
   let dragging = null;
   let resizing = null;
   let loadToken = 0;
+  // Output frame editing (free layout only): the frame is moved / resized over
+  // the images, which keep their place. While dragging, the view is frozen and
+  // the frame sits at (originX, originY) inside it; on release it re-centers.
+  let frameMode = false;  // "Adjust frame" toggle
+  let ctrlHover = false;  // Ctrl held while hovering: same as the toggle
+  let frameDrag = null;
+  let frozen = null;      // { m, vw, vh } of the view while a frame drag is running
+  let originX = 0, originY = 0;
 
   const isFree = () => cols * rows === 1;
   // The editing view is the output frame plus a margin on every side, so that
   // images (and their handles) reaching outside the frame stay workable.
-  const margin = () => Math.round(Math.max(W, H) * MARGIN_RATIO);
-  const viewW = () => W + margin() * 2;
-  const viewH = () => H + margin() * 2;
+  const margin = () => frozen ? frozen.m : Math.round(Math.max(W, H) * MARGIN_RATIO);
+  const viewW = () => frozen ? frozen.vw : W + margin() * 2;
+  const viewH = () => frozen ? frozen.vh : H + margin() * 2;
 
   // --- DOM ---
   const root = el("div", "icm-root");
@@ -265,6 +273,12 @@ function createEditor(node, stateWidget) {
     commit();
   });
 
+  const frameBtn = button("Adjust frame", () => {
+    frameMode = !frameMode;
+    syncToolbar();
+    render();
+  });
+  frameBtn.title = "Move / resize the output frame over the images with the mouse (1×1 only). Holding Ctrl does the same.";
   const frontBtn = button("Front", () => reorder(true));
   const backBtn = button("Back", () => reorder(false));
 
@@ -282,7 +296,7 @@ function createEditor(node, stateWidget) {
       button("Load image", () => fileInput.click(), "primary"),
       button("Remove", removeActive),
       button("Clear all", clearAll),
-      frontBtn, backBtn,
+      frontBtn, backBtn, frameBtn,
     ),
   );
   area.appendChild(canvas);
@@ -309,7 +323,9 @@ function createEditor(node, stateWidget) {
     borderCheck.input.checked = border;
     borderCheck.input.disabled = isFree();
     borderCheck.wrap.classList.toggle("disabled", isFree());
-    frontBtn.hidden = backBtn.hidden = !isFree();
+    frontBtn.hidden = backBtn.hidden = frameBtn.hidden = !isFree();
+    if (!isFree()) frameMode = false;
+    frameBtn.classList.toggle("active", frameMode);
   }
 
   // --- state <-> widget ---
@@ -529,7 +545,7 @@ function createEditor(node, stateWidget) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     // Origin = top-left of the output frame; the margin lies at negative coordinates.
-    ctx.setTransform(vs, 0, 0, vs, m * vs, m * vs);
+    ctx.setTransform(vs, 0, 0, vs, (m + originX) * vs, (m + originY) * vs);
 
     // Whole images, faint: whatever stays visible outside the frame is not saved.
     ctx.save();
@@ -610,6 +626,27 @@ function createEditor(node, stateWidget) {
       label(it.missing ? "Missing image" : "Loading…", it.ix, it.iy, it.iw, it.ih);
     }
 
+    if (isFree() && (frameMode || ctrlHover || frameDrag)) {
+      // Frame editing: solid outline with corner and edge handles.
+      const hs = HANDLE_PX * s;
+      ctx.save();
+      ctx.strokeStyle = "#fbbf24";
+      ctx.lineWidth = Math.max(1, 2 * s);
+      ctx.strokeRect(0, 0, W, H);
+      ctx.fillStyle = "#fbbf24";
+      ctx.strokeStyle = "#000";
+      ctx.lineWidth = Math.max(1, s);
+      for (const x of [0, W / 2, W]) {
+        for (const y of [0, H / 2, H]) {
+          if (x === W / 2 && y === H / 2) continue;
+          ctx.fillRect(x - hs / 2, y - hs / 2, hs, hs);
+          ctx.strokeRect(x - hs / 2, y - hs / 2, hs, hs);
+        }
+      }
+      ctx.restore();
+      return;
+    }
+
     if (activeCell >= 0 && !isFree()) {
       const b = cellBounds(activeCell);
       const lw = Math.max(1, 2 * s);
@@ -649,9 +686,83 @@ function createEditor(node, stateWidget) {
   function getCoords(e) {
     const r = canvas.getBoundingClientRect();
     return {
-      x: (e.clientX - r.left) * (viewW() / r.width) - margin(),
-      y: (e.clientY - r.top) * (viewH() / r.height) - margin(),
+      x: (e.clientX - r.left) * (viewW() / r.width) - margin() - originX,
+      y: (e.clientY - r.top) * (viewH() / r.height) - margin() - originY,
     };
+  }
+
+  // --- output frame editing ---
+  // Which part of the frame is under the pointer: an edge/corner ("l", "tr", ...),
+  // "move" inside the frame, or null outside.
+  function hitFrame(p) {
+    const tol = HANDLE_PX * pxScale() * 0.8;
+    if (p.x < -tol || p.y < -tol || p.x > W + tol || p.y > H + tol) return null;
+    const kind =
+      (Math.abs(p.y) <= tol ? "t" : Math.abs(p.y - H) <= tol ? "b" : "") +
+      (Math.abs(p.x) <= tol ? "l" : Math.abs(p.x - W) <= tol ? "r" : "");
+    return kind || "move";
+  }
+
+  function frameCursor(kind) {
+    if (!kind) return "default";
+    if (kind === "move") return "move";
+    if (kind === "tl" || kind === "br") return "nwse-resize";
+    if (kind === "tr" || kind === "bl") return "nesw-resize";
+    return kind === "l" || kind === "r" ? "ew-resize" : "ns-resize";
+  }
+
+  // New frame rect, in the coordinates of the frame as it was when the drag began.
+  function draggedFrame(fd, p) {
+    const dx = p.x - fd.start.x, dy = p.y - fd.start.y;
+    const k = fd.kind;
+    if (k === "move") return { x: Math.round(dx), y: Math.round(dy), w: fd.W, h: fd.H };
+    const left = k.includes("l"), right = k.includes("r"), top = k.includes("t"), bottom = k.includes("b");
+    let w = clampSize(fd.W + (right ? dx : left ? -dx : 0), fd.W);
+    let h = clampSize(fd.H + (bottom ? dy : top ? -dy : 0), fd.H);
+    const ratio = aspect === "free" ? null : parseAspect(aspect);
+    if (ratio) {
+      // Fixed aspect: the dragged width (or height, for top/bottom edges) leads.
+      if (left || right) {
+        h = clampSize(w / ratio, fd.H);
+        w = clampSize(h * ratio, fd.W);
+      } else {
+        w = clampSize(h * ratio, fd.W);
+        h = clampSize(w / ratio, fd.H);
+      }
+    }
+    // The side opposite to the dragged one stays put; an axis that only follows
+    // the aspect grows around its center.
+    const x = left ? fd.W - w : right ? 0 : (fd.W - w) / 2;
+    const y = top ? fd.H - h : bottom ? 0 : (fd.H - h) / 2;
+    return { x: Math.round(x), y: Math.round(y), w, h };
+  }
+
+  function startFrameDrag(kind, p) {
+    frozen = { m: margin(), vw: viewW(), vh: viewH() };
+    frameDrag = { kind, start: p, W, H, items: items.map(it => ({ it, ix: it.ix, iy: it.iy })) };
+  }
+
+  function updateFrameDrag(e) {
+    const c = getCoords(e);
+    const r = draggedFrame(frameDrag, { x: c.x + originX, y: c.y + originY });
+    W = r.w; H = r.h;
+    originX = r.x; originY = r.y;
+    for (const o of frameDrag.items) {
+      o.it.ix = o.ix - r.x;
+      o.it.iy = o.iy - r.y;
+    }
+    widthInput.value = W;
+    heightInput.value = H;
+    render();
+  }
+
+  function endFrameDrag() {
+    frameDrag = null;
+    frozen = null;
+    originX = originY = 0;
+    resizeCanvas();
+    syncToolbar();
+    commit();
   }
 
   function hitCell(p) {
@@ -783,6 +894,16 @@ function createEditor(node, stateWidget) {
     e.preventDefault();
     canvas.focus({ preventScroll: true });
 
+    if (isFree() && (frameMode || e.ctrlKey || e.metaKey)) {
+      const kind = hitFrame(p);
+      if (kind) {
+        startFrameDrag(kind, p);
+        try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+        render();
+      }
+      return;
+    }
+
     const corner = hitCorner(active, p);
     if (corner) {
       resizing = {
@@ -815,7 +936,21 @@ function createEditor(node, stateWidget) {
   });
 
   canvas.addEventListener("pointermove", e => {
+    if (frameDrag) {
+      e.preventDefault();
+      updateFrameDrag(e);
+      return;
+    }
     const p = getCoords(e);
+    const ctrl = isFree() && !dragging && !resizing && (e.ctrlKey || e.metaKey);
+    if (ctrl !== ctrlHover) {
+      ctrlHover = ctrl;
+      render();
+    }
+    if (isFree() && (frameMode || ctrl) && !dragging && !resizing) {
+      canvas.style.cursor = frameCursor(hitFrame(p));
+      return;
+    }
     if (dragging) {
       e.preventDefault();
       if (!active) return;
@@ -866,6 +1001,11 @@ function createEditor(node, stateWidget) {
   });
 
   function endPointer(e) {
+    if (frameDrag) {
+      try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+      endFrameDrag();
+      return;
+    }
     if (dragging || resizing) {
       try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
       dragging = null;
