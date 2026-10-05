@@ -8,7 +8,7 @@ from PIL import Image
 import folder_paths
 from comfy_api.latest import ComfyExtension, io
 
-from .collage import image_names, parse_state, render_collage
+from .collage import image_names, parse_state, render_collage, render_mask
 
 
 def _resolve_input_path(name):
@@ -38,13 +38,13 @@ class ImageCollage(io.ComfyNode):
             node_id="ImageCanvasMini_ImageCollage",
             display_name="Image Collage (Canvas mini)",
             category="ImageCanvas-mini",
-            description="Drop images onto the canvas on the node, arrange them in a grid or freely, and output the composited image.",
-            search_aliases=["collage", "grid", "concat", "stitch", "combine images", "pad", "padding"],
+            description="Drop images onto the canvas on the node, arrange them in a grid or freely, and output the composited image. A mask painted on the node is output for inpainting.",
+            search_aliases=["collage", "grid", "concat", "stitch", "combine images", "pad", "padding", "rotate", "inpaint mask"],
             inputs=[
                 # Written by web/image_collage.js; the text widget itself is hidden.
                 io.String.Input("canvas_state", default="", socketless=True),
             ],
-            outputs=[io.Image.Output(display_name="image")],
+            outputs=[io.Image.Output(display_name="image"), io.Mask.Output(display_name="mask")],
         )
 
     @classmethod
@@ -71,9 +71,11 @@ class ImageCollage(io.ComfyNode):
 
     @classmethod
     def execute(cls, canvas_state) -> io.NodeOutput:
-        canvas = render_collage(parse_state(canvas_state), _open_image)
+        state = parse_state(canvas_state)
+        canvas = render_collage(state, _open_image)
         image = torch.from_numpy(np.asarray(canvas, dtype=np.float32) / 255.0).unsqueeze(0)
-        return io.NodeOutput(image)
+        mask = torch.from_numpy(np.asarray(render_mask(state), dtype=np.float32) / 255.0).unsqueeze(0)
+        return io.NodeOutput(image, mask)
 
 
 class ImageCanvasMiniExtension(ComfyExtension):

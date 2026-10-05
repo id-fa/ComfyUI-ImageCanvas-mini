@@ -17,11 +17,16 @@ const MAX_SIZE = 8192;
 const MAX_VIEW_PX = 2048;  // the editing canvas is drawn at most this large
 const V1_CELL = 512;       // cell size of the first state format
 const HANDLE_PX = 10;      // resize handle size in screen pixels
+const ROT_HANDLE_PX = 26;  // distance of the rotation handle from the top edge, in screen pixels
+const ROT_SNAP = 15;       // degrees, while Shift is held
 const MIN_IMG = 20;
-const MIN_HEIGHT = 320;
+const MIN_HEIGHT = 360;
 const FREE_ADD_FRACTION = 0.6;
 const MARGIN_RATIO = 0.2;  // work area around the output frame, relative to its longer side
 const GHOST_ALPHA = 0.3;   // opacity of image parts outside the output (not saved)
+const MASK_COLOR = "#ff3030";
+const BRUSH_MIN = 2, BRUSH_MAX = 512, BRUSH_DEFAULT = 64;  // output pixels
+const MASK_UNDO_MAX = 100;
 const GRIDS = [
   { cols: 1, rows: 1, label: "1×1" },
   { cols: 2, rows: 1, label: "1×2" },
@@ -37,6 +42,7 @@ const STYLE = `
 .icm-root { display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 0; box-sizing: border-box; font-family: sans-serif; }
 .icm-toolbar { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; padding: 4px; background: #1a1a24; border: 1px solid #2a2a3a; border-radius: 4px 4px 0 0; }
 .icm-group { display: flex; gap: 3px; align-items: center; }
+.icm-group[hidden] { display: none; }
 .icm-label { font-size: 11px; color: #c4b5fd; white-space: nowrap; }
 .icm-sep { width: 1px; height: 18px; background: #3a3a4a; }
 .icm-btn { padding: 2px 7px; font-size: 11px; line-height: 1.4; background: #2a2a3a; border: 1px solid #4a4a5a; border-radius: 4px; color: #d1d5db; cursor: pointer; white-space: nowrap; }
@@ -44,12 +50,17 @@ const STYLE = `
 .icm-btn.active { background: #7c3aed; border-color: #7c3aed; color: #fff; }
 .icm-btn.primary { background: #065f46; border-color: #10b981; color: #d1fae5; }
 .icm-btn.primary:hover { background: #047857; }
+.icm-btn.mask.active { background: #b91c1c; border-color: #ef4444; }
+.icm-btn:disabled { opacity: 0.45; cursor: default; }
 .icm-btn[hidden], .icm-input[hidden] { display: none; }
 .icm-input { box-sizing: border-box; height: 20px; padding: 0 4px; font-size: 11px; background: #12121a; border: 1px solid #4a4a5a; border-radius: 4px; color: #e5e7eb; }
 .icm-input.num { width: 52px; }
 .icm-input.hex { width: 62px; }
 .icm-input.ratio { width: 52px; }
+.icm-input.angle { width: 44px; }
 .icm-input.invalid { border-color: #ef4444; }
+.icm-input:disabled { opacity: 0.45; }
+.icm-range { width: 90px; height: 16px; margin: 0; accent-color: #ef4444; }
 .icm-color { width: 24px; height: 20px; padding: 0; background: none; border: 1px solid #4a4a5a; border-radius: 4px; cursor: pointer; }
 .icm-check { font-size: 11px; color: #c4b5fd; cursor: pointer; display: flex; align-items: center; gap: 3px; white-space: nowrap; }
 .icm-check input { margin: 0; }
@@ -60,7 +71,8 @@ const STYLE = `
 .icm-status { flex: 0 0 auto; padding: 2px 4px; font-size: 10px; color: #9ca3af; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; background: #1a1a24; border: 1px solid #2a2a3a; border-top: none; border-radius: 0 0 4px 4px; }
 .icm-status.error { color: #fca5a5; }
 `;
-const HINT = "Drop images · Drag: move · Corners: resize · Del: remove · Ctrl+drag: frame (1×1)";
+const HINT = "Drop images · Drag: move · Corners: resize · Top handle: rotate (Shift: 15°) · Del: remove · Ctrl+drag: frame (1×1)";
+const HINT_MASK = "Mask: drag to paint the inpaint area · Ctrl+Z: undo · turn Mask off to edit images";
 
 function ensureStyle() {
   if (document.getElementById(STYLE_ID)) return;
@@ -123,6 +135,13 @@ function round2(v) {
   return Math.round(v * 100) / 100;
 }
 
+// Any angle in degrees -> (-180, 180], one decimal.
+function normAngle(deg) {
+  let a = ((Number(deg) % 360) + 360) % 360;
+  if (a > 180) a -= 360;
+  return Math.round(a * 10) / 10 || 0;
+}
+
 function viewUrl(name) {
   const slash = name.lastIndexOf("/");
   const params = new URLSearchParams({
@@ -159,13 +178,15 @@ function createEditor(node, stateWidget) {
   let cols = 2, rows = 2;
   let bgColor = "#000000";
   let border = true;
-  // item: { image, img, cell, ix, iy, iw, ih, aspect, missing }  (img is null while loading / missing)
+  // item: { image, img, cell, ix, iy, iw, ih, rot, aspect, missing }  (img is null while loading / missing)
+  // ix/iy/iw/ih is the unrotated box; `rot` (degrees, clockwise) turns it around its center.
   // Drawn in array order, so the last item is on top.
   let items = [];
   let active = null;      // selected item
   let activeCell = -1;    // selected cell (grid layouts)
   let dragging = null;
   let resizing = null;
+  let rotating = null;
   let loadToken = 0;
   // Output frame editing (free layout only): the frame is moved / resized over
   // the images, which keep their place. While dragging, the view is frozen and
@@ -175,6 +196,16 @@ function createEditor(node, stateWidget) {
   let frameDrag = null;
   let frozen = null;      // { m, vw, vh } of the view while a frame drag is running
   let originX = 0, originY = 0;
+  // Inpaint mask: brush strokes in output pixels, replayed in order.
+  // stroke: { s: brush diameter, e: 1 for eraser, p: [x0, y0, x1, y1, ...] }
+  let strokes = [];
+  let maskUndo = [];      // earlier `strokes` arrays (not saved with the workflow)
+  let maskMode = false;
+  let eraser = false;
+  let brushSize = BRUSH_DEFAULT;
+  let stroke = null;      // stroke being painted
+  let hoverPos = null;    // brush cursor position in mask mode
+  const maskCanvas = document.createElement("canvas");
 
   const isFree = () => cols * rows === 1;
   // The editing view is the output frame plus a margin on every side, so that
@@ -273,14 +304,47 @@ function createEditor(node, stateWidget) {
     commit();
   });
 
-  const frameBtn = button("Adjust frame", () => {
-    frameMode = !frameMode;
-    syncToolbar();
-    render();
+  const angleInput = textInput("angle", "Rotation of the selected image in degrees (clockwise)");
+  angleInput.inputMode = "decimal";
+  angleInput.addEventListener("change", () => {
+    const value = Number(angleInput.value);
+    if (!active || !Number.isFinite(value)) return render();
+    active.rot = normAngle(value);
+    commit();
   });
+  const resetRotBtn = button("0°", () => {
+    if (!active) return;
+    active.rot = 0;
+    commit();
+  });
+  resetRotBtn.title = "Reset the rotation of the selected image";
+
+  const frameBtn = button("Adjust frame", () => setMode(frameMode ? null : "frame"));
   frameBtn.title = "Move / resize the output frame over the images with the mouse (1×1 only). Holding Ctrl does the same.";
   const frontBtn = button("Front", () => reorder(true));
   const backBtn = button("Back", () => reorder(false));
+
+  const maskBtn = button("Mask", () => setMode(maskMode ? null : "mask"), "mask");
+  maskBtn.title = "Paint the inpaint mask over the whole output (mask output)";
+  const brushBtn = button("Brush", () => { eraser = false; syncToolbar(); });
+  const eraserBtn = button("Eraser", () => { eraser = true; syncToolbar(); });
+  const brushRange = el("input", "icm-range");
+  brushRange.type = "range";
+  brushRange.min = BRUSH_MIN;
+  brushRange.max = BRUSH_MAX;
+  brushRange.title = "Brush size in output pixels";
+  const brushLabel = el("span", "icm-label");
+  brushRange.addEventListener("input", () => {
+    brushSize = Math.max(BRUSH_MIN, Math.min(BRUSH_MAX, Number(brushRange.value) || BRUSH_DEFAULT));
+    brushLabel.textContent = brushSize + "px";
+    render();
+  });
+  const undoBtn = button("Undo", undoMask);
+  undoBtn.title = "Undo the last mask stroke (Ctrl+Z)";
+  const clearMaskBtn = button("Clear mask", clearMask);
+  const maskTools = group(
+    brushBtn, eraserBtn, el("span", "icm-label", "Size:"), brushRange, brushLabel, undoBtn, clearMaskBtn,
+  );
 
   toolbar.append(
     group(el("span", "icm-label", "Grid:"), ...gridButtons),
@@ -298,13 +362,28 @@ function createEditor(node, stateWidget) {
       button("Clear all", clearAll),
       frontBtn, backBtn, frameBtn,
     ),
+    group(el("span", "icm-label", "Rotate:"), angleInput, resetRotBtn),
+    el("div", "icm-sep"),
+    group(maskBtn), maskTools,
   );
   area.appendChild(canvas);
   root.append(toolbar, area, status, fileInput);
 
   function setStatus(text, isError) {
-    status.textContent = text || HINT;
+    status.textContent = text || (maskMode ? HINT_MASK : HINT);
     status.classList.toggle("error", !!isError);
+  }
+
+  // The editor is in one mode at a time: images (null), "frame" or "mask".
+  function setMode(mode) {
+    frameMode = mode === "frame" && isFree();
+    maskMode = mode === "mask";
+    stroke = null;
+    hoverPos = null;
+    canvas.style.cursor = maskMode ? "crosshair" : "default";
+    syncToolbar();
+    setStatus("");
+    render();
   }
 
   function syncToolbar() {
@@ -326,18 +405,32 @@ function createEditor(node, stateWidget) {
     frontBtn.hidden = backBtn.hidden = frameBtn.hidden = !isFree();
     if (!isFree()) frameMode = false;
     frameBtn.classList.toggle("active", frameMode);
+    maskBtn.classList.toggle("active", maskMode);
+    maskTools.hidden = !maskMode;
+    brushBtn.classList.toggle("active", !eraser);
+    eraserBtn.classList.toggle("active", eraser);
+    brushRange.value = brushSize;
+    brushLabel.textContent = brushSize + "px";
+    undoBtn.disabled = !maskUndo.length;
+    clearMaskBtn.disabled = !strokes.length;
   }
 
   // --- state <-> widget ---
   function saveState() {
-    stateWidget.value = JSON.stringify({
+    const state = {
       v: 2, width: W, height: H, aspect, cols, rows, bg: bgColor, border,
       keepRatio: keepRatio.input.checked,
-      items: items.filter(it => it.image).map(it => ({
-        image: it.image, cell: it.cell,
-        x: round2(it.ix), y: round2(it.iy), w: round2(it.iw), h: round2(it.ih),
-      })),
-    });
+      items: items.filter(it => it.image).map(it => {
+        const saved = {
+          image: it.image, cell: it.cell,
+          x: round2(it.ix), y: round2(it.iy), w: round2(it.iw), h: round2(it.ih),
+        };
+        if (it.rot) saved.rot = it.rot;
+        return saved;
+      }),
+    };
+    if (strokes.length) state.mask = strokes.map(st => ({ s: st.s, e: st.e, p: st.p }));
+    stateWidget.value = JSON.stringify(state);
     node.setDirtyCanvas?.(true, true);
   }
 
@@ -370,13 +463,22 @@ function createEditor(node, stateWidget) {
     keepRatio.input.checked = state.keepRatio !== false;
     active = null;
     activeCell = -1;
-    dragging = resizing = null;
+    dragging = resizing = rotating = null;
+    stroke = null;
+    maskUndo = [];
+    strokes = (Array.isArray(state.mask) ? state.mask : [])
+      .filter(st => st && Array.isArray(st.p) && st.p.length >= 2 && st.p.every(Number.isFinite) && st.s > 0)
+      .map(st => ({ s: +st.s, e: st.e ? 1 : 0, p: st.p.slice(0, st.p.length & ~1) }));
 
     const token = ++loadToken;
     items = saved
       .filter(s => s && s.image && Number.isInteger(s.cell) && s.cell >= 0 && s.cell < cols * rows)
       .map(s => {
-        const item = { image: s.image, img: null, cell: s.cell, ix: +s.x || 0, iy: +s.y || 0, iw: +s.w || 100, ih: +s.h || 100 };
+        const item = {
+          image: s.image, img: null, cell: s.cell,
+          ix: +s.x || 0, iy: +s.y || 0, iw: +s.w || 100, ih: +s.h || 100,
+          rot: normAngle(+s.rot || 0),
+        };
         item.aspect = item.iw / item.ih;
         loadImage(viewUrl(s.image)).then(img => {
           if (token !== loadToken) return;
@@ -400,6 +502,27 @@ function createEditor(node, stateWidget) {
   function cellBounds(idx) {
     const cw = W / cols, ch = H / rows;
     return { cx: (idx % cols) * cw, cy: Math.floor(idx / cols) * ch, cw, ch };
+  }
+
+  const rad = item => (item.rot || 0) * Math.PI / 180;
+  const centerOf = item => ({ x: item.ix + item.iw / 2, y: item.iy + item.ih / 2 });
+
+  function rotateVec(x, y, angle) {
+    const c = Math.cos(angle), s = Math.sin(angle);
+    return { x: x * c - y * s, y: x * s + y * c };
+  }
+
+  // Canvas point -> the item's own axes, relative to its center.
+  function toLocal(item, p) {
+    const c = centerOf(item);
+    return rotateVec(p.x - c.x, p.y - c.y, -rad(item));
+  }
+
+  // Point in the item's own axes (relative to its center) -> canvas point.
+  function toWorld(item, x, y) {
+    const c = centerOf(item);
+    const v = rotateVec(x, y, rad(item));
+    return { x: c.x + v.x, y: c.y + v.y };
   }
 
   // Grid cells are filled (cover); the free layout shows the whole image (contain).
@@ -460,6 +583,12 @@ function createEditor(node, stateWidget) {
           oy: (it.iy + it.ih / 2 - b.cy) / b.ch,
         };
       });
+      // The mask follows like an image filling the canvas: scaled around the center.
+      const f = isFree() ? Math.min(nw / W, nh / H) : Math.max(nw / W, nh / H);
+      for (const st of strokes) {
+        st.s = Math.max(1, round2(st.s * f));
+        st.p = st.p.map((v, i) => Math.round(i % 2 ? (v - H / 2) * f + nh / 2 : (v - W / 2) * f + nw / 2));
+      }
       W = nw; H = nh;
       for (const { it, ar, zoom, ox, oy } of placed) {
         const b = cellBounds(it.cell);
@@ -536,6 +665,58 @@ function createEditor(node, stateWidget) {
   }
 
   // --- drawing ---
+  // Run `draw` with the origin at the item's center and its rotation applied.
+  function inItemSpace(ctx, item, draw) {
+    const c = centerOf(item);
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.rotate(rad(item));
+    draw(-item.iw / 2, -item.ih / 2, item.iw, item.ih);
+    ctx.restore();
+  }
+
+  function drawImageOf(ctx, item) {
+    inItemSpace(ctx, item, (x, y, w, h) => ctx.drawImage(item.img, x, y, w, h));
+  }
+
+  function traceStroke(ctx, st) {
+    ctx.globalCompositeOperation = st.e ? "destination-out" : "source-over";
+    ctx.lineWidth = st.s;
+    ctx.beginPath();
+    ctx.moveTo(st.p[0], st.p[1]);
+    // A single point still needs a segment for the round cap to draw a dot.
+    if (st.p.length === 2) ctx.lineTo(st.p[0], st.p[1]);
+    for (let i = 2; i < st.p.length; i += 2) ctx.lineTo(st.p[i], st.p[i + 1]);
+    ctx.stroke();
+  }
+
+  // Replay the strokes on an offscreen canvas, then lay it over the frame.
+  function drawMask(ctx, transform) {
+    if (!strokes.length && !stroke) return;
+    if (maskCanvas.width !== canvas.width || maskCanvas.height !== canvas.height) {
+      maskCanvas.width = canvas.width;
+      maskCanvas.height = canvas.height;
+    }
+    const mctx = maskCanvas.getContext("2d");
+    mctx.setTransform(1, 0, 0, 1, 0, 0);
+    mctx.globalCompositeOperation = "source-over";
+    mctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+    mctx.setTransform(...transform);
+    mctx.strokeStyle = MASK_COLOR;
+    mctx.lineCap = mctx.lineJoin = "round";
+    for (const st of strokes) traceStroke(mctx, st);
+    if (stroke) traceStroke(mctx, stroke);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, W, H);   // only the part inside the frame is output
+    ctx.clip();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = maskMode ? 0.55 : 0.35;
+    ctx.drawImage(maskCanvas, 0, 0);
+    ctx.restore();
+  }
+
   function render() {
     const ctx = canvas.getContext("2d");
     const vs = canvas.width / viewW();
@@ -545,13 +726,14 @@ function createEditor(node, stateWidget) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     // Origin = top-left of the output frame; the margin lies at negative coordinates.
-    ctx.setTransform(vs, 0, 0, vs, (m + originX) * vs, (m + originY) * vs);
+    const transform = [vs, 0, 0, vs, (m + originX) * vs, (m + originY) * vs];
+    ctx.setTransform(...transform);
 
     // Whole images, faint: whatever stays visible outside the frame is not saved.
     ctx.save();
     ctx.globalAlpha = GHOST_ALPHA;
     for (const it of items) {
-      if (it.img) ctx.drawImage(it.img, it.ix, it.iy, it.iw, it.ih);
+      if (it.img) drawImageOf(ctx, it);
     }
     ctx.restore();
 
@@ -566,7 +748,7 @@ function createEditor(node, stateWidget) {
       ctx.beginPath();
       ctx.rect(b.cx, b.cy, b.cw, b.ch);
       ctx.clip();
-      ctx.drawImage(it.img, it.ix, it.iy, it.iw, it.ih);
+      drawImageOf(ctx, it);
       ctx.restore();
     }
 
@@ -589,7 +771,9 @@ function createEditor(node, stateWidget) {
       }
     }
 
-    // Editing overlays below are not part of the output.
+    // Editing overlays below are not part of the image output.
+    drawMask(ctx, transform);
+
     ctx.save();
     ctx.strokeStyle = "rgba(255,255,255,0.45)";
     ctx.lineWidth = Math.max(1, s);
@@ -617,13 +801,35 @@ function createEditor(node, stateWidget) {
     }
     for (const it of items) {
       if (it.img) continue;
-      ctx.save();
       ctx.strokeStyle = hintColor;
       ctx.lineWidth = Math.max(1, s);
-      ctx.setLineDash([4 * s, 4 * s]);
-      ctx.strokeRect(it.ix, it.iy, it.iw, it.ih);
-      ctx.restore();
-      label(it.missing ? "Missing image" : "Loading…", it.ix, it.iy, it.iw, it.ih);
+      inItemSpace(ctx, it, (x, y, w, h) => {
+        ctx.setLineDash([4 * s, 4 * s]);
+        ctx.strokeRect(x, y, w, h);
+        label(it.missing ? "Missing image" : "Loading…", x, y, w, h);
+      });
+    }
+
+    // The angle field mirrors the selection (unless it is being typed into).
+    angleInput.disabled = resetRotBtn.disabled = !active;
+    if (document.activeElement !== angleInput) angleInput.value = active ? String(active.rot || 0) : "";
+
+    if (maskMode) {
+      if (hoverPos) {
+        // Brush cursor.
+        ctx.save();
+        ctx.lineWidth = Math.max(1, s);
+        ctx.strokeStyle = "#000";
+        ctx.beginPath();
+        ctx.arc(hoverPos.x, hoverPos.y, brushSize / 2 + s, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = "#fff";
+        ctx.beginPath();
+        ctx.arc(hoverPos.x, hoverPos.y, brushSize / 2, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+      return;
     }
 
     if (isFree() && (frameMode || ctrlHover || frameDrag)) {
@@ -658,16 +864,30 @@ function createEditor(node, stateWidget) {
       ctx.restore();
     }
     if (active) {
+      // Outline, corner handles and the rotation handle, all turned with the image.
       const hs = HANDLE_PX * s;
       ctx.save();
-      ctx.strokeStyle = "#a78bfa";
       ctx.lineWidth = Math.max(1, s);
-      ctx.strokeRect(active.ix, active.iy, active.iw, active.ih);
-      ctx.fillStyle = "#a78bfa";
-      ctx.strokeStyle = "#fff";
-      corners(active).forEach(c => {
-        ctx.fillRect(c.x - hs / 2, c.y - hs / 2, hs, hs);
-        ctx.strokeRect(c.x - hs / 2, c.y - hs / 2, hs, hs);
+      inItemSpace(ctx, active, (x, y, w, h) => {
+        const ry = y - ROT_HANDLE_PX * s;
+        ctx.strokeStyle = "#a78bfa";
+        ctx.strokeRect(x, y, w, h);
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(0, ry);
+        ctx.stroke();
+        ctx.fillStyle = "#a78bfa";
+        ctx.strokeStyle = "#fff";
+        for (const cx of [x, x + w]) {
+          for (const cy of [y, y + h]) {
+            ctx.fillRect(cx - hs / 2, cy - hs / 2, hs, hs);
+            ctx.strokeRect(cx - hs / 2, cy - hs / 2, hs, hs);
+          }
+        }
+        ctx.beginPath();
+        ctx.arc(0, ry, hs * 0.6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
       });
       ctx.restore();
     }
@@ -675,12 +895,17 @@ function createEditor(node, stateWidget) {
 
   // --- hit testing ---
   function corners(item) {
+    const w = item.iw / 2, h = item.ih / 2;
     return [
-      { x: item.ix, y: item.iy, name: "tl" },
-      { x: item.ix + item.iw, y: item.iy, name: "tr" },
-      { x: item.ix, y: item.iy + item.ih, name: "bl" },
-      { x: item.ix + item.iw, y: item.iy + item.ih, name: "br" },
+      { ...toWorld(item, -w, -h), name: "tl" },
+      { ...toWorld(item, w, -h), name: "tr" },
+      { ...toWorld(item, -w, h), name: "bl" },
+      { ...toWorld(item, w, h), name: "br" },
     ];
+  }
+
+  function rotHandle(item) {
+    return toWorld(item, 0, -item.ih / 2 - ROT_HANDLE_PX * pxScale());
   }
 
   function getCoords(e) {
@@ -739,9 +964,14 @@ function createEditor(node, stateWidget) {
 
   function startFrameDrag(kind, p) {
     frozen = { m: margin(), vw: viewW(), vh: viewH() };
-    frameDrag = { kind, start: p, W, H, items: items.map(it => ({ it, ix: it.ix, iy: it.iy })) };
+    frameDrag = {
+      kind, start: p, W, H,
+      items: items.map(it => ({ it, ix: it.ix, iy: it.iy })),
+      strokes: strokes.map(st => ({ st, p: st.p.slice() })),
+    };
   }
 
+  // Images and mask keep their place; only the frame (= the coordinate origin) moves.
   function updateFrameDrag(e) {
     const c = getCoords(e);
     const r = draggedFrame(frameDrag, { x: c.x + originX, y: c.y + originY });
@@ -750,6 +980,9 @@ function createEditor(node, stateWidget) {
     for (const o of frameDrag.items) {
       o.it.ix = o.ix - r.x;
       o.it.iy = o.iy - r.y;
+    }
+    for (const o of frameDrag.strokes) {
+      o.st.p = o.p.map((v, i) => v - (i % 2 ? r.y : r.x));
     }
     widthInput.value = W;
     heightInput.value = H;
@@ -781,10 +1014,16 @@ function createEditor(node, stateWidget) {
     return null;
   }
 
+  function hitRotHandle(item, p) {
+    if (!item) return false;
+    const h = rotHandle(item);
+    return Math.hypot(p.x - h.x, p.y - h.y) <= HANDLE_PX * pxScale();
+  }
+
   function insideItem(item, p) {
-    return !!item &&
-      p.x >= item.ix && p.x <= item.ix + item.iw &&
-      p.y >= item.iy && p.y <= item.iy + item.ih;
+    if (!item) return false;
+    const l = toLocal(item, p);
+    return Math.abs(l.x) <= item.iw / 2 && Math.abs(l.y) <= item.ih / 2;
   }
 
   // Topmost item under the pointer. Inside a grid only the item of the cell
@@ -811,7 +1050,7 @@ function createEditor(node, stateWidget) {
 
   // --- adding / removing images ---
   function placeImage(img, image, cell, point, offset) {
-    const item = { image, img, aspect: img.naturalWidth / img.naturalHeight };
+    const item = { image, img, rot: 0, aspect: img.naturalWidth / img.naturalHeight };
     if (isFree()) {
       // First image fills the canvas (letterboxed); later ones are added smaller.
       item.cell = 0;
@@ -887,31 +1126,88 @@ function createEditor(node, stateWidget) {
     commit();
   }
 
+  // --- mask ---
+  // Every change replaces the `strokes` array, so the old one can serve as the undo step.
+  function setStrokes(next) {
+    maskUndo.push(strokes);
+    if (maskUndo.length > MASK_UNDO_MAX) maskUndo.shift();
+    strokes = next;
+    syncToolbar();
+    commit();
+  }
+
+  function undoMask() {
+    if (!maskUndo.length) return;
+    strokes = maskUndo.pop();
+    syncToolbar();
+    commit();
+  }
+
+  function clearMask() {
+    if (strokes.length) setStrokes([]);
+  }
+
+  function extendStroke(p) {
+    const n = stroke.p.length;
+    // Skip points closer than ~1.5 screen pixels to keep the saved state small.
+    if (Math.hypot(p.x - stroke.p[n - 2], p.y - stroke.p[n - 1]) < Math.max(1, 1.5 * pxScale())) return;
+    stroke.p.push(Math.round(p.x), Math.round(p.y));
+  }
+
+  function endStroke() {
+    const done = stroke;
+    stroke = null;
+    // Erasing an empty mask changes nothing.
+    if (done.e && !strokes.length) return render();
+    setStrokes([...strokes, done]);
+  }
+
   // --- pointer events ---
+  function capture(e) {
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  }
+
   canvas.addEventListener("pointerdown", e => {
     if (e.button !== 0) return;
     const p = getCoords(e);
     e.preventDefault();
     canvas.focus({ preventScroll: true });
 
+    if (maskMode) {
+      stroke = { s: brushSize, e: eraser ? 1 : 0, p: [Math.round(p.x), Math.round(p.y)] };
+      hoverPos = p;
+      capture(e);
+      render();
+      return;
+    }
+
     if (isFree() && (frameMode || e.ctrlKey || e.metaKey)) {
       const kind = hitFrame(p);
       if (kind) {
         startFrameDrag(kind, p);
-        try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+        capture(e);
         render();
       }
       return;
     }
 
+    if (hitRotHandle(active, p)) {
+      const c = centerOf(active);
+      rotating = { start: Math.atan2(p.y - c.y, p.x - c.x), orig: active.rot || 0 };
+      capture(e);
+      return;
+    }
+
     const corner = hitCorner(active, p);
     if (corner) {
+      // The corner opposite to the dragged one stays where it is.
+      const sx = corner.includes("r") ? 1 : -1, sy = corner.includes("b") ? 1 : -1;
       resizing = {
-        startX: p.x, startY: p.y,
-        origX: active.ix, origY: active.iy, origW: active.iw, origH: active.ih,
-        aspect: active.aspect, corner,
+        start: p, sx, sy,
+        origW: active.iw, origH: active.ih, aspect: active.iw / active.ih,
+        anchor: toWorld(active, -sx * active.iw / 2, -sy * active.ih / 2),
       };
-      try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+      capture(e);
       return;
     }
 
@@ -930,7 +1226,7 @@ function createEditor(node, stateWidget) {
     }
     if (hit) {
       dragging = { startX: p.x, startY: p.y, origX: hit.ix, origY: hit.iy };
-      try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+      capture(e);
     }
     render();
   });
@@ -942,12 +1238,22 @@ function createEditor(node, stateWidget) {
       return;
     }
     const p = getCoords(e);
-    const ctrl = isFree() && !dragging && !resizing && (e.ctrlKey || e.metaKey);
+    if (maskMode) {
+      hoverPos = p;
+      if (stroke) {
+        e.preventDefault();
+        extendStroke(p);
+      }
+      render();
+      return;
+    }
+    const busy = dragging || resizing || rotating;
+    const ctrl = isFree() && !busy && (e.ctrlKey || e.metaKey);
     if (ctrl !== ctrlHover) {
       ctrlHover = ctrl;
       render();
     }
-    if (isFree() && (frameMode || ctrl) && !dragging && !resizing) {
+    if (isFree() && (frameMode || ctrl) && !busy) {
       canvas.style.cursor = frameCursor(hitFrame(p));
       return;
     }
@@ -959,39 +1265,40 @@ function createEditor(node, stateWidget) {
       render();
       return;
     }
+    if (rotating) {
+      e.preventDefault();
+      if (!active) return;
+      const c = centerOf(active);
+      const turned = (Math.atan2(p.y - c.y, p.x - c.x) - rotating.start) * 180 / Math.PI;
+      let rot = rotating.orig + turned;
+      if (e.shiftKey) rot = Math.round(rot / ROT_SNAP) * ROT_SNAP;
+      active.rot = normAngle(rot);
+      render();
+      return;
+    }
     if (resizing) {
       e.preventDefault();
       if (!active) return;
-      const dx = p.x - resizing.startX;
-      const dy = p.y - resizing.startY;
-      const keep = keepRatio.input.checked;
-      const ratio = resizing.aspect;
+      // Pointer movement along the image's own (rotated) axes.
+      const d = rotateVec(p.x - resizing.start.x, p.y - resizing.start.y, -rad(active));
       const min = MIN_IMG * pxScale();
-      let nx = resizing.origX, ny = resizing.origY;
-      let nw = resizing.origW, nh = resizing.origH;
-      const cn = resizing.corner;
-      if (cn === "br") {
-        nw = Math.max(min, resizing.origW + dx);
-        nh = keep ? nw / ratio : Math.max(min, resizing.origH + dy);
-      } else if (cn === "bl") {
-        nw = Math.max(min, resizing.origW - dx);
-        nh = keep ? nw / ratio : Math.max(min, resizing.origH + dy);
-        nx = resizing.origX + resizing.origW - nw;
-      } else if (cn === "tr") {
-        nw = Math.max(min, resizing.origW + dx);
-        nh = keep ? nw / ratio : Math.max(min, resizing.origH - dy);
-        ny = resizing.origY + resizing.origH - nh;
-      } else if (cn === "tl") {
-        nw = Math.max(min, resizing.origW - dx);
-        nh = keep ? nw / ratio : Math.max(min, resizing.origH - dy);
-        nx = resizing.origX + resizing.origW - nw;
-        ny = resizing.origY + resizing.origH - nh;
-      }
-      active.ix = nx; active.iy = ny; active.iw = nw; active.ih = nh;
+      const nw = Math.max(min, resizing.origW + resizing.sx * d.x);
+      const nh = keepRatio.input.checked
+        ? nw / resizing.aspect
+        : Math.max(min, resizing.origH + resizing.sy * d.y);
+      const half = rotateVec(resizing.sx * nw / 2, resizing.sy * nh / 2, rad(active));
+      active.iw = nw;
+      active.ih = nh;
+      active.ix = resizing.anchor.x + half.x - nw / 2;
+      active.iy = resizing.anchor.y + half.y - nh / 2;
       render();
       return;
     }
 
+    if (hitRotHandle(active, p)) {
+      canvas.style.cursor = "grab";
+      return;
+    }
     const corner = hitCorner(active, p);
     if (corner) {
       canvas.style.cursor = (corner === "tl" || corner === "br") ? "nwse-resize" : "nesw-resize";
@@ -1001,27 +1308,31 @@ function createEditor(node, stateWidget) {
   });
 
   function endPointer(e) {
-    if (frameDrag) {
-      try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
-      endFrameDrag();
-      return;
-    }
-    if (dragging || resizing) {
-      try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
-      dragging = null;
-      resizing = null;
-      saveState();
-    }
+    if (!frameDrag && !stroke && !dragging && !resizing && !rotating) return;
+    try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+    if (frameDrag) return endFrameDrag();
+    if (stroke) return endStroke();
+    dragging = resizing = rotating = null;
+    saveState();
   }
   canvas.addEventListener("pointerup", endPointer);
   canvas.addEventListener("pointercancel", endPointer);
+  canvas.addEventListener("pointerleave", () => {
+    if (!hoverPos || stroke) return;
+    hoverPos = null;
+    render();
+  });
 
-  // Delete must not reach ComfyUI, which would remove the selected node.
+  // These keys must not reach ComfyUI (Delete would remove the selected node,
+  // Ctrl+Z would undo a graph change instead of a mask stroke).
   canvas.addEventListener("keydown", e => {
-    if (e.key !== "Delete" && e.key !== "Backspace") return;
+    const undo = maskMode && (e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z";
+    const del = e.key === "Delete" || e.key === "Backspace";
+    if (!undo && !del) return;
     e.preventDefault();
     e.stopPropagation();
-    removeActive();
+    if (undo) undoMask();
+    else if (!maskMode) removeActive();
   });
 
   // --- file drop (anywhere on the widget) ---
@@ -1087,7 +1398,7 @@ app.registerExtension({
         return true;
       };
 
-      this.setSize([Math.max(this.size[0], 460), Math.max(this.size[1], 640)]);
+      this.setSize([Math.max(this.size[0], 480), Math.max(this.size[1], 700)]);
       return result;
     };
 
