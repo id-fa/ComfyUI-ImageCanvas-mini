@@ -71,7 +71,7 @@ const STYLE = `
 .icm-status { flex: 0 0 auto; padding: 2px 4px; font-size: 10px; color: #9ca3af; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; background: #1a1a24; border: 1px solid #2a2a3a; border-top: none; border-radius: 0 0 4px 4px; }
 .icm-status.error { color: #fca5a5; }
 `;
-const HINT = "Drop images · Drag: move · Corners: resize · Top handle: rotate (Shift: 15°) · Del: remove · Ctrl+drag: frame (1×1)";
+const HINT = "Drop / paste (Ctrl+V) images · Drag: move · Corners: resize · Top handle: rotate (Shift: 15°) · Del: remove · Ctrl+drag: frame (1×1)";
 const HINT_MASK = "Mask: drag to paint the inpaint area · Ctrl+Z: undo · turn Mask off to edit images";
 
 function ensureStyle() {
@@ -102,6 +102,20 @@ function hasFiles(e) {
 
 function imageFiles(fileList) {
   return Array.from(fileList || []).filter(f => f.type.startsWith("image/"));
+}
+
+// Image files from a paste event. Clipboard bitmaps come in as "image.png";
+// give them a recognizable name (the server appends a counter on collisions).
+function clipboardImageFiles(e) {
+  const files = [];
+  for (const item of Array.from(e?.clipboardData?.items || [])) {
+    if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+    const f = item.getAsFile();
+    if (!f) continue;
+    const ext = (f.type.split("/")[1] || "png").replace("jpeg", "jpg").replace(/[^a-z0-9]/gi, "");
+    files.push(new File([f], `clipboard.${ext}`, { type: f.type }));
+  }
+  return files;
 }
 
 function clampSize(value, fallback) {
@@ -1333,6 +1347,17 @@ function createEditor(node, stateWidget) {
     e.stopPropagation();
     if (undo) undoMask();
     else if (!maskMode) removeActive();
+  });
+
+  // --- clipboard paste (canvas focused: click a cell, then Ctrl+V) ---
+  // Goes to the selected cell (or the first empty one); must not reach ComfyUI,
+  // which would otherwise create a Load Image node from the clipboard.
+  canvas.addEventListener("paste", e => {
+    const files = clipboardImageFiles(e);
+    if (!files.length) return;
+    e.preventDefault();
+    e.stopPropagation();
+    addFiles(files, null);
   });
 
   // --- file drop (anywhere on the widget) ---
