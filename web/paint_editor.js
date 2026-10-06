@@ -2,11 +2,14 @@
 // airbrush / eraser / cover, rectangular copy & paste, loupe, undo).
 // Ported from simple-image-edit-with-qwen's drawing editor.
 //
-// openPaintEditor({ img, width, height, bg }) -> Promise<{ blob, mode } | null>
-//   img:   HTMLImageElement to draw on, or null for a blank canvas of width×height
-//   bg:    fill color of the blank canvas (default white)
+// openPaintEditor({ img, width, height, bg, overlay }) -> Promise<{ blob, mode, empty } | null>
+//   img:     image (or canvas) to draw on, or null for a blank canvas of width×height
+//   bg:      fill color of the blank canvas (default white)
+//   overlay: pass an object to edit a transparent drawing layer over `img` instead
+//            of the image itself; `overlay.img` is the existing layer (or null).
 //   Resolves with the PNG blob when the user saves ("composite" = image + lines,
-//   "lines" = lines on a white background), or null when the editor is closed.
+//   "lines" = lines on a white background, "overlay" = the drawing layer alone,
+//   `empty` true when nothing is drawn), or null when the editor is closed.
 
 const COLORS = ["#000000", "#ffffff", "#ff0000", "#ff8800", "#ffff00", "#00cc00", "#0088ff", "#8800ff", "#ff00ff", "#884400"];
 const SIZES = [1, 2, 4, 8, 14, 24, 64];
@@ -112,11 +115,11 @@ function airbrushSpray(ctx, x, y, radius, color, density) {
   }
 }
 
-export function openPaintEditor({ img = null, width = 1024, height = 1024, bg = "#ffffff" } = {}) {
+export function openPaintEditor({ img = null, width = 1024, height = 1024, bg = "#ffffff", overlay = null } = {}) {
   ensureStyle();
   return new Promise(resolve => {
-    const w = img ? img.naturalWidth : Math.max(1, Math.round(width));
-    const h = img ? img.naturalHeight : Math.max(1, Math.round(height));
+    const w = img ? (img.naturalWidth || img.width) : Math.max(1, Math.round(width));
+    const h = img ? (img.naturalHeight || img.height) : Math.max(1, Math.round(height));
 
     // --- state ---
     let history = [];
@@ -146,6 +149,7 @@ export function openPaintEditor({ img = null, width = 1024, height = 1024, bg = 
       bgCtx.fillStyle = bg;
       bgCtx.fillRect(0, 0, w, h);
     }
+    if (overlay?.img) ctx.drawImage(overlay.img, 0, 0, w, h);
     wrap.append(bgCanvas, drawCanvas, selCanvas);
     area.appendChild(wrap);
 
@@ -217,10 +221,20 @@ export function openPaintEditor({ img = null, width = 1024, height = 1024, bg = 
     pasteBtn.title = "Paste the copied region (Select a rectangle first)";
     const undoBtn = button("Undo", undo);
     undoBtn.title = "Ctrl+Z";
-    const saveBtn = button("Save (+bg)", () => finish("composite"), "save");
-    saveBtn.title = "Replace the image with image + lines";
+    const clearBtn = button("Clear", () => {
+      if (history.length <= 1 && !overlay?.img) return;
+      ctx.clearRect(0, 0, w, h);
+      dirty = true;
+      pushHistory();
+    });
+    clearBtn.title = "Remove all lines";
+    const saveBtn = overlay
+      ? button("Save", () => finish("overlay"), "save")
+      : button("Save (+bg)", () => finish("composite"), "save");
+    saveBtn.title = overlay ? "Save the lines as a layer over the collage" : "Replace the image with image + lines";
     const linesBtn = button("Save (lines)", () => finish("lines"), "save");
     linesBtn.title = "Replace the image with the lines on a white background";
+    linesBtn.hidden = !!overlay;
     const closeBtn = button("Close", () => close(), "close");
     closeBtn.title = "Esc";
 
@@ -240,7 +254,7 @@ export function openPaintEditor({ img = null, width = 1024, height = 1024, bg = 
     const toolGroup = el("div", "icmp-group");
     toolGroup.append(...toolButtons);
     const actionGroup = el("div", "icmp-group");
-    actionGroup.append(pasteBtn, undoBtn, saveBtn, linesBtn, closeBtn);
+    actionGroup.append(pasteBtn, undoBtn, clearBtn, saveBtn, linesBtn, closeBtn);
     toolbar.append(
       toolGroup, el("div", "icmp-sep"),
       colorGroup, el("div", "icmp-sep"),
@@ -592,16 +606,21 @@ export function openPaintEditor({ img = null, width = 1024, height = 1024, bg = 
       const o = out.getContext("2d");
       if (mode === "composite") {
         o.drawImage(bgCanvas, 0, 0);
-      } else {
+      } else if (mode === "lines") {
         o.fillStyle = "#ffffff";
         o.fillRect(0, 0, w, h);
       }
       o.drawImage(drawCanvas, 0, 0);
+      const data = history[history.length - 1].data;
+      let empty = true;
+      for (let i = 3; i < data.length; i += 4) {
+        if (data[i]) { empty = false; break; }
+      }
       saveBtn.disabled = linesBtn.disabled = true;
       out.toBlob(blob => {
         teardown();
         if (!blob) return resolve(null);
-        resolve({ blob, mode });
+        resolve({ blob, mode, empty });
       }, "image/png");
     }
 

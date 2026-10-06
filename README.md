@@ -27,7 +27,7 @@ ComfyUI を再起動してください。Python の依存パッケージは追�
 
 画像の入力スロットはありません。画像はノードに直接読み込みます。
 
-1. ノードを追加し、画像をキャンバスにドラッグ&ドロップします(`Load image` ボタンでも読み込めます)。複数枚まとめてドロップできます。
+1. ノードを追加し、画像をキャンバスにドラッグ&ドロップします(`Load image` ボタン、またはキャンバスをクリックしてから `Ctrl+V` でクリップボードの画像を貼り付けることもできます)。複数枚まとめてドロップできます。
 2. 画像をクリックして選択し、ドラッグで移動、四隅のハンドルでリサイズ、上に伸びた丸いハンドルで回転します。
 3. ワークフローを実行すると、破線の出力枠の内側がそのまま `image` として出力されます。
 
@@ -61,7 +61,18 @@ ComfyUI を再起動してください。Python の依存パッケージは追�
 | `Rotate` | 角度を数値で指定(時計回り)。`0°` でリセット |
 | `Front` / `Back` | 重なり順の変更(`1×1` のみ) |
 | `Remove` / `Delete` キー | 選択した画像を外す |
-| `Clear all` | すべての画像を外す |
+| `Clear all` | すべての画像(と `Paint all` の描画)を外す |
+
+### 描画(`Paint` / `Paint all`)
+
+ラフスケッチや、AI に編集箇所を指示するためのマークを描けます。簡単なペイントエディタが全画面で開きます。
+
+| ボタン | 内容 |
+|---|---|
+| `Paint` | 選択した画像に直接描きます。`Save (+bg)` で画像+線、`Save (lines)` で白地に線だけを新しい画像として保存し、セルの画像を差し替えます(元の画像ファイルは残ります)。空のセルを選んで押すと、セルと同じサイズの白紙から描けます |
+| `Paint all` | コラージュ全体の上に描きます。線は別のレイヤーとして保存され、下の画像はその後も動かせます。もう一度開けば線の続きを描いたり消しゴムで消したりでき、`Clear` して保存するとレイヤーが消えます |
+
+エディタのツール: `Pen` / `Brush`(筆圧)/ `Air`(エアブラシ)/ `Eraser`(線だけ消す)/ `Cover`(白で塗りつぶし)/ `Select`(矩形を選んでコピーし、`Paste` で貼り付け・移動・リサイズ)。`Undo`(`Ctrl+Z`)、`Esc` で閉じます。
 
 ### 出力枠の調整(`1×1` のみ)
 
@@ -95,6 +106,7 @@ ComfyUI を再起動してください。Python の依存パッケージは追�
 
 - 読み込んだ画像は ComfyUI の `input/imagecanvas_mini/` に保存されます。ワークフローを他の環境に持っていく場合は、このフォルダの画像も必要です。
 - マスクはブラシの軌跡としてワークフロー内に保存されます(画像ファイルは作りません)。
+- `Paint` の結果は `<元の名前>_paint.png`、`Paint all` のレイヤーは `collage_overlay.png` として同じフォルダに保存されます(同名で内容が違うと連番が付きます)。
 
 ## ライセンス
 
@@ -131,7 +143,7 @@ Restart ComfyUI. No Python dependencies are added.
 
 The node has no image input slot. Images are loaded directly into the node.
 
-1. Add the node and drag and drop images onto its canvas (or use the `Load image` button). You can drop several at once.
+1. Add the node and drag and drop images onto its canvas (or use the `Load image` button, or click the canvas and press `Ctrl+V` to paste an image from the clipboard). You can drop several at once.
 2. Click an image to select it, then drag to move, use the corner handles to resize, and the round handle above it to rotate.
 3. Run the workflow. Whatever is inside the dashed output frame is output as `image`.
 
@@ -165,7 +177,18 @@ The arrangement is saved with the workflow.
 | `Rotate` | Enter the angle as a number (clockwise). `0°` resets it |
 | `Front` / `Back` | Change the stacking order (`1×1` only) |
 | `Remove` / `Delete` key | Remove the selected image |
-| `Clear all` | Remove all images |
+| `Clear all` | Remove all images (and the `Paint all` drawing) |
+
+### Drawing (`Paint` / `Paint all`)
+
+For rough sketches, or marks that tell an AI what to edit. A simple full-screen paint editor opens.
+
+| Button | Description |
+|---|---|
+| `Paint` | Draw directly on the selected image. `Save (+bg)` stores image + lines, `Save (lines)` the lines on white, as a new image that replaces the one in the cell (the original file is kept). With an empty cell selected it starts from a blank canvas of the cell's size |
+| `Paint all` | Draw over the whole collage. The lines are stored as a separate layer, so the images underneath stay editable. Open it again to continue or erase lines; `Clear` and save removes the layer |
+
+Editor tools: `Pen` / `Brush` (pressure) / `Air` (airbrush) / `Eraser` (lines only) / `Cover` (paint over with white) / `Select` (select a rectangle to copy, then `Paste` to place, move and resize it). `Undo` (`Ctrl+Z`), `Esc` closes.
 
 ### Adjusting the output frame (`1×1` only)
 
@@ -199,6 +222,7 @@ Set `Grid` to `1×1` and place a single image: it is fitted inside the output fr
 
 - Loaded images are stored in ComfyUI's `input/imagecanvas_mini/`. To move a workflow to another environment, the images in this folder are needed too.
 - The mask is saved inside the workflow as brush strokes (no image file is created).
+- `Paint` results are stored as `<original name>_paint.png` and the `Paint all` layer as `collage_overlay.png` in the same folder (a counter is appended when the name exists with different content).
 
 ## License
 

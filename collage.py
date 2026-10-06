@@ -8,7 +8,8 @@ State layout (JSON written by the frontend):
       "width": 1024, "height": 1024, "cols": 2, "rows": 2,
       "bg": "#000000", "border": true,
       "items": [{"image": "imagecanvas_mini/a.png", "cell": 0, "x": 0, "y": 0, "w": 512, "h": 512, "rot": 0}, ...],
-      "mask": [{"s": 64, "e": 0, "p": [x0, y0, x1, y1, ...]}, ...]
+      "mask": [{"s": 64, "e": 0, "p": [x0, y0, x1, y1, ...]}, ...],
+      "overlay": "imagecanvas_mini/collage_overlay.png"
     }
 Item coordinates are output pixels. Items are drawn in list order (last on top),
 each clipped to its grid cell. x/y/w/h is the unrotated box; "rot" (degrees,
@@ -16,6 +17,8 @@ clockwise) turns it around its center. A 1x1 grid is the free layout: any
 number of items on the whole canvas, no border lines.
 "mask" is the inpaint mask as brush strokes replayed in order: "s" is the brush
 diameter, "e" marks an eraser stroke, "p" the flattened points.
+"overlay" (optional) is a transparent drawing layer painted over the whole
+output; it is stretched to the output size and composited last.
 """
 
 import json
@@ -56,6 +59,7 @@ def parse_state(raw):
         and _clamp_int(it.get("cell"), 0, cols * rows - 1, -1) == it.get("cell")
     ]
     bg = state.get("bg")
+    overlay = state.get("overlay")
     mask = state.get("mask")
     if not isinstance(mask, list):
         mask = []
@@ -68,6 +72,7 @@ def parse_state(raw):
         "border": bool(state.get("border", True)),
         "items": items,
         "mask": [st for st in (_parse_stroke(st) for st in mask) if st],
+        "overlay": overlay if isinstance(overlay, str) and overlay else None,
     }
 
 
@@ -84,7 +89,11 @@ def _parse_stroke(stroke):
 
 
 def image_names(state):
-    return [it["image"] for it in state["items"]]
+    """Every input-folder file the state refers to (items and the overlay)."""
+    names = [it["image"] for it in state["items"]]
+    if state["overlay"]:
+        names.append(state["overlay"])
+    return names
 
 
 def _draw_item(canvas, img, item, bounds):
@@ -205,6 +214,12 @@ def render_collage(state, open_image):
 
     if state["border"] and cols * rows > 1:
         _draw_borders(canvas, cols, rows, bg_rgb)
+
+    if state["overlay"]:
+        layer = ImageOps.exif_transpose(open_image(state["overlay"])).convert("RGBA")
+        if layer.size != (width, height):
+            layer = layer.resize((width, height), Image.LANCZOS)
+        canvas.paste(layer, (0, 0), layer)
     return canvas
 
 

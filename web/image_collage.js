@@ -221,6 +221,9 @@ function createEditor(node, stateWidget) {
   let stroke = null;      // stroke being painted
   let hoverPos = null;    // brush cursor position in mask mode
   let painting = false;   // the paint editor is open
+  // Drawing layer over the whole output ("Paint all"): a transparent PNG in the
+  // input folder, stretched to W×H and composited last (before the mask).
+  let overlay = null;     // { image, img }
   const maskCanvas = document.createElement("canvas");
 
   const isFree = () => cols * rows === 1;
@@ -336,7 +339,9 @@ function createEditor(node, stateWidget) {
   resetRotBtn.title = "Reset the rotation of the selected image";
 
   const paintBtn = button("Paint", paintActive);
-  paintBtn.title = "Draw on the selected image (or start a blank sketch in the selected cell)";
+  paintBtn.title = "Draw on the selected image, start a blank sketch in the selected cell, or (nothing selected) draw over the whole output";
+  const paintAllBtn = button("Paint all", paintAll);
+  paintAllBtn.title = "Draw over the whole output as a layer on top of the collage (the images stay editable)";
   const frameBtn = button("Adjust frame", () => setMode(frameMode ? null : "frame"));
   frameBtn.title = "Move / resize the output frame over the images with the mouse (1×1 only). Holding Ctrl does the same.";
   const frontBtn = button("Front", () => reorder(true));
@@ -376,7 +381,7 @@ function createEditor(node, stateWidget) {
     el("div", "icm-sep"),
     group(
       button("Load image", () => fileInput.click(), "primary"),
-      paintBtn,
+      paintBtn, paintAllBtn,
       button("Remove", removeActive),
       button("Clear all", clearAll),
       frontBtn, backBtn, frameBtn,
@@ -425,7 +430,8 @@ function createEditor(node, stateWidget) {
     if (!isFree()) frameMode = false;
     frameBtn.classList.toggle("active", frameMode);
     maskBtn.classList.toggle("active", maskMode);
-    paintBtn.disabled = maskMode || painting;
+    paintBtn.disabled = paintAllBtn.disabled = maskMode || painting;
+    paintAllBtn.classList.toggle("active", !!overlay);
     maskTools.hidden = !maskMode;
     brushBtn.classList.toggle("active", !eraser);
     eraserBtn.classList.toggle("active", eraser);
@@ -450,6 +456,7 @@ function createEditor(node, stateWidget) {
       }),
     };
     if (strokes.length) state.mask = strokes.map(st => ({ s: st.s, e: st.e, p: st.p }));
+    if (overlay) state.overlay = overlay.image;
     stateWidget.value = JSON.stringify(state);
     node.setDirtyCanvas?.(true, true);
   }
@@ -491,6 +498,15 @@ function createEditor(node, stateWidget) {
       .map(st => ({ s: +st.s, e: st.e ? 1 : 0, p: st.p.slice(0, st.p.length & ~1) }));
 
     const token = ++loadToken;
+    overlay = typeof state.overlay === "string" && state.overlay ? { image: state.overlay, img: null } : null;
+    if (overlay) {
+      const ov = overlay;
+      loadImage(viewUrl(ov.image)).then(img => {
+        if (token !== loadToken) return;
+        ov.img = img;
+        render();
+      }).catch(() => {});
+    }
     items = saved
       .filter(s => s && s.image && Number.isInteger(s.cell) && s.cell >= 0 && s.cell < cols * rows)
       .map(s => {
@@ -737,6 +753,43 @@ function createEditor(node, stateWidget) {
     ctx.restore();
   }
 
+  // The output image (without the overlay layer) in output coordinates. Must
+  // match render_collage in collage.py.
+  function drawOutput(ctx) {
+    ctx.fillStyle = bgColor;
+    ctx.fillRect(0, 0, W, H);
+
+    for (const it of items) {
+      if (!it.img) continue;
+      const b = cellBounds(it.cell);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(b.cx, b.cy, b.cw, b.ch);
+      ctx.clip();
+      drawImageOf(ctx, it);
+      ctx.restore();
+    }
+
+    if (border && !isFree()) {
+      const bw = Math.max(2, Math.round(Math.min(W, H) / 256));
+      ctx.strokeStyle = isDark(bgColor) ? "#ffffff" : "#000000";
+      ctx.lineWidth = bw;
+      ctx.strokeRect(bw / 2, bw / 2, W - bw, H - bw);
+      for (let c = 1; c < cols; c++) {
+        ctx.beginPath();
+        ctx.moveTo(c * W / cols, 0);
+        ctx.lineTo(c * W / cols, H);
+        ctx.stroke();
+      }
+      for (let r = 1; r < rows; r++) {
+        ctx.beginPath();
+        ctx.moveTo(0, r * H / rows);
+        ctx.lineTo(W, r * H / rows);
+        ctx.stroke();
+      }
+    }
+  }
+
   function render() {
     const ctx = canvas.getContext("2d");
     const vs = canvas.width / viewW();
@@ -758,38 +811,8 @@ function createEditor(node, stateWidget) {
     ctx.restore();
 
     // The output frame, exactly as it will be composited.
-    ctx.fillStyle = bgColor;
-    ctx.fillRect(0, 0, W, H);
-
-    for (const it of items) {
-      if (!it.img) continue;
-      const b = cellBounds(it.cell);
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(b.cx, b.cy, b.cw, b.ch);
-      ctx.clip();
-      drawImageOf(ctx, it);
-      ctx.restore();
-    }
-
-    if (border && !isFree()) {
-      const bw = Math.max(2, Math.round(Math.min(W, H) / 256));
-      ctx.strokeStyle = dark ? "#ffffff" : "#000000";
-      ctx.lineWidth = bw;
-      ctx.strokeRect(bw / 2, bw / 2, W - bw, H - bw);
-      for (let c = 1; c < cols; c++) {
-        ctx.beginPath();
-        ctx.moveTo(c * W / cols, 0);
-        ctx.lineTo(c * W / cols, H);
-        ctx.stroke();
-      }
-      for (let r = 1; r < rows; r++) {
-        ctx.beginPath();
-        ctx.moveTo(0, r * H / rows);
-        ctx.lineTo(W, r * H / rows);
-        ctx.stroke();
-      }
-    }
+    drawOutput(ctx);
+    if (overlay?.img) ctx.drawImage(overlay.img, 0, 0, W, H);
 
     // Editing overlays below are not part of the image output.
     drawMask(ctx, transform);
@@ -1128,6 +1151,7 @@ function createEditor(node, stateWidget) {
   async function paintActive() {
     if (maskMode || painting) return;
     const item = active || (activeCell >= 0 ? itemInCell(activeCell) : null);
+    if (!item && (isFree() || activeCell < 0)) return paintAll();
     if (item && !item.img) return setStatus("The image is not loaded yet", true);
     const cell = isFree() ? 0 : Math.max(0, Math.min(activeCell, cols * rows - 1));
     const b = cellBounds(cell);
@@ -1169,6 +1193,47 @@ function createEditor(node, stateWidget) {
     }
   }
 
+  // Draw over the whole output. The lines are kept as a separate transparent
+  // layer, so the images underneath stay editable. An empty layer is removed.
+  async function paintAll() {
+    if (maskMode || painting) return;
+    if (overlay && !overlay.img) return setStatus("The drawing layer is not loaded yet", true);
+    const composite = document.createElement("canvas");
+    composite.width = W;
+    composite.height = H;
+    drawOutput(composite.getContext("2d"));
+    painting = true;
+    syncToolbar();
+    let result = null;
+    try {
+      result = await openPaintEditor({ img: composite, overlay: { img: overlay?.img || null } });
+    } finally {
+      painting = false;
+      syncToolbar();
+    }
+    if (!result) return;
+    if (result.empty) {
+      overlay = null;
+      syncToolbar();
+      commit();
+      return;
+    }
+    const file = new File([result.blob], "collage_overlay.png", { type: "image/png" });
+    const url = URL.createObjectURL(file);
+    try {
+      setStatus(`Uploading ${file.name}…`);
+      const [image, img] = await Promise.all([uploadImage(file), loadImage(url)]);
+      overlay = { image, img };
+      syncToolbar();
+      commit();
+      setStatus("");
+    } catch (err) {
+      setStatus(`Failed to save the drawing: ${err.message || err}`, true);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
   function removeActive() {
     const item = active || (activeCell >= 0 ? itemInCell(activeCell) : null);
     if (!item) return;
@@ -1178,11 +1243,13 @@ function createEditor(node, stateWidget) {
   }
 
   function clearAll() {
-    if (!items.length) return;
+    if (!items.length && !overlay) return;
     if (!confirm("Remove all images?")) return;
     items = [];
+    overlay = null;
     active = null;
     activeCell = -1;
+    syncToolbar();
     commit();
   }
 
