@@ -1,5 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { openPaintEditor } from "./paint_editor.js";
 
 // Collage editor shown directly on the "Image Collage" node.
 // The arrangement is stored as JSON in the (hidden) `canvas_state` widget and
@@ -219,6 +220,7 @@ function createEditor(node, stateWidget) {
   let brushSize = BRUSH_DEFAULT;
   let stroke = null;      // stroke being painted
   let hoverPos = null;    // brush cursor position in mask mode
+  let painting = false;   // the paint editor is open
   const maskCanvas = document.createElement("canvas");
 
   const isFree = () => cols * rows === 1;
@@ -333,6 +335,8 @@ function createEditor(node, stateWidget) {
   });
   resetRotBtn.title = "Reset the rotation of the selected image";
 
+  const paintBtn = button("Paint", paintActive);
+  paintBtn.title = "Draw on the selected image (or start a blank sketch in the selected cell)";
   const frameBtn = button("Adjust frame", () => setMode(frameMode ? null : "frame"));
   frameBtn.title = "Move / resize the output frame over the images with the mouse (1×1 only). Holding Ctrl does the same.";
   const frontBtn = button("Front", () => reorder(true));
@@ -372,6 +376,7 @@ function createEditor(node, stateWidget) {
     el("div", "icm-sep"),
     group(
       button("Load image", () => fileInput.click(), "primary"),
+      paintBtn,
       button("Remove", removeActive),
       button("Clear all", clearAll),
       frontBtn, backBtn, frameBtn,
@@ -420,6 +425,7 @@ function createEditor(node, stateWidget) {
     if (!isFree()) frameMode = false;
     frameBtn.classList.toggle("active", frameMode);
     maskBtn.classList.toggle("active", maskMode);
+    paintBtn.disabled = maskMode || painting;
     maskTools.hidden = !maskMode;
     brushBtn.classList.toggle("active", !eraser);
     eraserBtn.classList.toggle("active", eraser);
@@ -1113,6 +1119,53 @@ function createEditor(node, stateWidget) {
       } finally {
         URL.revokeObjectURL(url);
       }
+    }
+  }
+
+  // Open the paint editor on the selected image. With an empty cell (or nothing
+  // selected in the free layout) it starts from a blank white canvas the size of
+  // the cell. The result is uploaded as a new file and replaces the image in place.
+  async function paintActive() {
+    if (maskMode || painting) return;
+    const item = active || (activeCell >= 0 ? itemInCell(activeCell) : null);
+    if (item && !item.img) return setStatus("The image is not loaded yet", true);
+    const cell = isFree() ? 0 : Math.max(0, Math.min(activeCell, cols * rows - 1));
+    const b = cellBounds(cell);
+    painting = true;
+    syncToolbar();
+    let result = null;
+    try {
+      result = await openPaintEditor(item
+        ? { img: item.img }
+        : { width: Math.round(b.cw), height: Math.round(b.ch), bg: "#ffffff" });
+    } finally {
+      painting = false;
+      syncToolbar();
+    }
+    if (!result) return;
+    // a.png -> a_paint.png; editing a_paint.png (or "a_paint (2).png") again keeps the name.
+    const base = item
+      ? item.image.split("/").pop().replace(/\.[^.]*$/, "").replace(/_paint( \(\d+\))?$/, "")
+      : "sketch";
+    const file = new File([result.blob], `${base}_paint.png`, { type: "image/png" });
+    const url = URL.createObjectURL(file);
+    try {
+      setStatus(`Uploading ${file.name}…`);
+      const [image, img] = await Promise.all([uploadImage(file), loadImage(url)]);
+      if (item && items.includes(item)) {
+        item.image = image;
+        item.img = img;
+        item.aspect = img.naturalWidth / img.naturalHeight;
+        active = item;
+        commit();
+      } else {
+        placeImage(img, image, cell, null, 0);
+      }
+      setStatus("");
+    } catch (err) {
+      setStatus(`Failed to save the drawing: ${err.message || err}`, true);
+    } finally {
+      URL.revokeObjectURL(url);
     }
   }
 

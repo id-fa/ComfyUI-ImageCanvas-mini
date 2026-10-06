@@ -1,7 +1,7 @@
 [project]
 name = "imagecanvas-mini"
 description = "Small image editing tools for ComfyUI. Image Collage: drop images onto a grid on the node, arrange them, and output the composited image."
-version = "0.1.1"
+version = "0.1.2"
 license = {text = "MIT license"}
 dependencies = []
 
